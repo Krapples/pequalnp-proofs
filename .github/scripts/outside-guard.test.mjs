@@ -397,7 +397,157 @@ test('all problems: a listed outside module names every problem too', () => {
 });
 test('a matched word that is not one of the listed literals is still sanitised', () => {
   assert.throws(() => run(`${thm}  #zz_q 1\n`), (e) => e.message.startsWith('line 5: "?zz_q" is not allowed'));
-  assert.throws(() => run(`${thm}  exact x% y\n`), (e) => e.message.startsWith('line 5: "x?" is not allowed'));
+  // (a single character before % is the remainder operator since sign 91; the sanitising is shown on a longer name)
+  assert.throws(() => run(`${thm}  exact xy% y\n`), (e) => e.message.startsWith('line 5: "xy?" is not allowed'));
   assert.throws(() => run(`${thm}  exact \x60(foo| y)\n`), (e) => e.message.startsWith('line 5: "??foo?" is not allowed'));
   assert.throws(() => run(`${thm}  exact \x60(tactic| y)\n`), (e) => e.message.startsWith('line 5: "\x60(tactic|" is not allowed'));
+});
+test('the bv_decide refusal says what to use instead (a repeated honest mistake)', () => {
+  assert.throws(() => checkPlainAll(`theorem PEqualNP.Outside.L_x : True := by\n  bv_decide\n`), (e) => /bv_decide runs a SAT solver as the file builds, so use tactics the kernel checks alone, e\.g\. decide \(small sizes\), simp, omega, rfl$/.test(e.message));
+});
+// More than one file: the refusal carries the fixed sentence the contributor can act on (red team, 2026-11-24: a repeated honest mistake).
+test('more than one file: the refusal says to send each step as its own pull request', () => {
+  const sha = 'a'.repeat(40), blob = 'b'.repeat(40);
+  const two = [{ filename: RF(3), status: 'added', sha: blob }, { filename: RF(4), status: 'added', sha: blob }];
+  const pr = n => ({ state: 'open', base: { repo: { full_name: 'o/r' }, ref: 'main' }, head: { sha }, user: { login: 'someone' }, changed_files: n });
+  const SAY = /one file per pull request, so send each step as its own pull request/;
+  assert.throws(() => checkPrR(pr(2), two, { tree: [] }, 'o/r', 'main'), SAY);
+  assert.throws(() => checkPrR(pr(7), two, { tree: [] }, 'o/r', 'main'), /changes 7 files; one file per pull request, so/);
+  // the count says one, the list says two: still the sentence
+  assert.throws(() => checkPrR(pr(1), two, { tree: [] }, 'o/r', 'main'), SAY);
+  // no file is not "more than one": the old text, no sentence
+  assert.throws(() => checkPrR(pr(0), [], { tree: [] }, 'o/r', 'main'), e => /must add exactly one/.test(e.message) && !SAY.test(e.message));
+});
+// The % rule (red team sign 91, 2026-11-24): the remainder operator after a single character or a number is plain;
+// a name of two or more characters straight before % (a library term macro such as eval%) is refused.
+test('the remainder operator after one character or a number is plain; a longer name before % is refused', () => {
+  const T = (body) => `theorem PEqualNP.Outside.L_x : True := by\n  ${body}\n  trivial\n`;
+  for (const ok of ['have h : n%2 = n % 2 := rfl', 'have h : (k%m) = k % m := rfl', 'have h : 10%3 = 1 := rfl', 'have h : (a+b)%2 = (a+b)%2 := rfl'])
+    checkPlainAll(T(ok));
+  for (const bad of ['have h := eval% (1 + 1)', 'have h := type_of% x', 'have h : ab%2 = 0 := sorry', 'have h := x1%y', 'have h := decl_name%'])
+    assert.throws(() => checkPlainAll(T(bad)), /is not allowed|sorry/, bad);
+});
+
+// A VALUE STEP: the desk's row carries a template and a bound, and the statement judged is the
+// template with the file name's k put in. One fixture per way a wrong k could be judged, refused.
+import { checkGap as checkGapValue, checkFileKind as checkFileKindV, checkPr as checkPrV, valueGap, rowOfFile, FILE_RE as FILE_RE_V, V_FILE_RE, VALUE_RE } from './outside-guard.mjs';
+const VT = 'Size.AtMost f @@VALUE@@ ∧\n  ¬ Size.AtMost f (@@VALUE@@ - 1)';
+const VF = (k, gap = 'meta_700') => `lean/PEqualNP/Outside/V_${gap}__k${k}.lean`;
+const vrow = (more = {}) => ({ gaps: [{ id: 'L-meta-700', kind: 'value', template: VT, value_holes: 2, value_max: 12, imports: ['PEqualNP.Defs'], ...more },
+  { id: 'L-meta-70', kind: 'value', template: VT, value_holes: 2, value_max: 99, imports: [] }, { id: 'L-meta-632', file: KF, module: 'PEqualNP.Outside.L_meta_632', statement: 'True', imports: [] }] });
+const pick700 = (x) => x.id === 'L-meta-700';
+test('value: the statement is the template with k put in, every occurrence, byte for byte; the kind is check', () => {
+  const g = checkGapValue(vrow(), pick700, VF(6), 'check');
+  assert.equal(g.statement, 'Size.AtMost f 6 ∧\n  ¬ Size.AtMost f (6 - 1)');
+  assert.equal(g.kind, 'check'); assert.equal(g.value, 6); assert.deepEqual(g.imports, ['PEqualNP.Defs']);
+  assert.equal(checkGapValue(vrow(), pick700, VF(0), 'check').statement, 'Size.AtMost f 0 ∧\n  ¬ Size.AtMost f (0 - 1)');
+  assert.equal(checkGapValue(vrow(), pick700, VF(12)).value, 12, 'the bound itself is a value');
+});
+test('value E1: the numeral is plain ASCII digits, no leading zero, at most the bound', () => {
+  for (const ok of ['0', '6', '12', '9999']) assert.ok(VALUE_RE.test(ok), ok);
+  for (const bad of ['06', '00', '+6', '-6', '6_0', '0x6', '６', '٦', '6.0', '1e1', '', '10000', ' 6']) {
+    assert.ok(!VALUE_RE.test(bad), bad);
+    assert.throws(() => checkGapValue(vrow(), pick700, VF(bad), 'check'), /the one file must be|not a value file/, `a file named for "${bad}"`);
+  }
+  assert.throws(() => checkGapValue(vrow(), pick700, VF(13), 'check'), /the value 13 is above the bound of gap L-meta-700: no value above 12 is judged/);
+  assert.throws(() => checkGapValue(vrow({ value_max: '12' }), pick700, VF(6), 'check'), /malformed value_max/);
+  assert.throws(() => checkGapValue(vrow({ value_max: undefined }), pick700, VF(6), 'check'), /malformed value_max/);
+});
+test('value E2: the file name is rebuilt from the gap and k and compared byte for byte', () => {
+  assert.throws(() => checkGapValue(vrow(), pick700, VF(6, 'meta_70'), 'check'), /is not the file of value 6 of gap L-meta-700 \(that is lean\/PEqualNP\/Outside\/V_meta_700__k6\.lean\)/);
+  assert.throws(() => checkGapValue(vrow(), pick700, VF(6, 'meta_7000'), 'check'), /is not the file of value 6 of gap L-meta-700/);
+  // A name that could be cut two ways if k were parsed out of it: the step 70 at "0__k6" is not a name at all.
+  assert.throws(() => checkGapValue(vrow(), pick700, 'lean/PEqualNP/Outside/V_meta_70__k0__k6.lean', 'check'), /is not the file of value 6 of gap L-meta-700/);
+  assert.throws(() => checkGapValue(vrow(), (x) => x.id === 'L-meta-70', 'lean/PEqualNP/Outside/V_meta_70__k0__k6.lean', 'check'), /is not the file of value 6 of gap L-meta-70 /);
+  assert.throws(() => checkGapValue(vrow(), pick700, 'lean/PEqualNP/Outside/V_meta_700_k6.lean', 'check'), /the one file must be/, 'a single underscore is not the separator');
+  assert.throws(() => checkGapValue(vrow(), pick700, 'lean/PEqualNP/Outside/L_meta_700.lean', 'check'), /is a value step, and .* is not a value file/);
+  assert.throws(() => checkGapValue(vrow(), pick700, 'lean/PEqualNP/Outside/R_meta_700_1.lean', 'reduce'), /is a value step; it is judged only by a run of kind check/);
+});
+test('value E3: the token count is the count stored at posting, each a whole term, and nothing else with at-signs', () => {
+  assert.throws(() => checkGapValue(vrow({ value_holes: 1 }), pick700, VF(6), 'check'), /holds @@VALUE@@ 2 time\(s\), and the step was posted with 1/);
+  assert.throws(() => checkGapValue(vrow({ template: 'Size.AtMost f @@VALUE@@' }), pick700, VF(6), 'check'), /holds @@VALUE@@ 1 time\(s\), and the step was posted with 2/);
+  assert.throws(() => checkGapValue(vrow({ template: 'Size.AtMost f VALUE', value_holes: 1 }), pick700, VF(6), 'check'), /holds @@VALUE@@ 0 time/, 'a bare word is never the token');
+  assert.throws(() => checkGapValue(vrow({ value_holes: 0, template: 'True' }), pick700, VF(6), 'check'), /malformed value_holes/);
+  assert.throws(() => checkGapValue(vrow({ template: 'Size.AtMost f x@@VALUE@@ ∧ g @@VALUE@@' }), pick700, VF(6), 'check'), /where it is not a whole term/);
+  assert.throws(() => checkGapValue(vrow({ template: 'Size.AtMost f @@VALUE@@1 ∧ g @@VALUE@@' }), pick700, VF(6), 'check'), /where it is not a whole term/, 'a digit glued to the hole would make another number');
+  assert.throws(() => checkGapValue(vrow({ template: 'Size.AtMost f @@VALUE@@ ∧ g @@VALUE@@ ∧ h @@ i' }), pick700, VF(6), 'check'), /a doubled at-sign that is not @@VALUE@@/);
+  assert.throws(() => checkGapValue(vrow({ template: undefined }), pick700, VF(6), 'check'), /a value step with no template/);
+  assert.throws(() => checkGapValue(vrow({ template: 'a @@VALUE@@ \0 @@VALUE@@' }), pick700, VF(6), 'check'), /a value step with no template/);
+});
+test('value: a value file is judged only for a value step, and only as a check', () => {
+  assert.throws(() => checkGapValue(vrow(), pick632, 'lean/PEqualNP/Outside/V_meta_632__k6.lean', 'check'), /is a value file, and the desk does not post gap L-meta-632 as a value step/);
+  assert.throws(() => checkGapValue(vrow(), pick700, VF(6), 'refute'), /judged only by a run of kind check/);
+  assert.throws(() => checkGapValue(vrow(), pick700, VF(6), 'reduce'), /judged only by a run of kind check/);
+  assert.throws(() => checkFileKindV(VF(6), 'refute'), /is a value file/);
+  assert.equal(checkFileKindV(VF(6), 'check'), VF(6));
+  assert.throws(() => valueGap(vrow().gaps[0], VF(6), 'refute'), /judged only by a run of kind check/);
+  assert.throws(() => checkGapValue(vrow({ imports: ['Mathlib.Evil'] }), pick700, VF(6), 'check'), /lists a malformed import/);
+});
+test('value: land-by-push does not take a value file (FILE_RE is unchanged), the pull request step does', () => {
+  assert.ok(!FILE_RE_V.test(VF(6)) && V_FILE_RE.test(VF(6)));
+  const sha = 'a'.repeat(40), blob = 'b'.repeat(40);
+  const pr = { state: 'open', base: { repo: { full_name: 'o/r' }, ref: 'main' }, head: { sha }, user: { login: 'someone' }, changed_files: 1 };
+  const r = checkPrV(pr, [{ filename: VF(6), status: 'added', sha: blob }], { tree: [{ path: VF(6), type: 'blob', mode: '100644', sha: blob, size: 10 }] }, 'o/r', 'main');
+  assert.equal(r.module, 'PEqualNP.Outside.V_meta_700__k6');
+  assert.throws(() => checkPrV(pr, [{ filename: VF('06'), status: 'added', sha: blob }], { tree: [] }, 'o/r', 'main'), /the one file must be/);
+});
+test('value: a settled value step is in the checked list, so a later file for any k is told so; a withdrawn one too', () => {
+  const settled = { gaps: [], checked: [{ id: 'L-meta-700', file: VF(6), file_sha256: 'c'.repeat(64) }], withdrawn: { 'L-meta-701': 'settled' } };
+  assert.throws(() => checkGapValue(settled, pick700, VF(7), 'check'), /L-meta-700 is already CHECKED/);
+  assert.throws(() => checkGapValue(settled, (x) => x.id === 'L-meta-701', VF(7, 'meta_701'), 'check'), /L-meta-701 was WITHDRAWN from the desk \(settled\)/);
+});
+test('value: the file of a value step finds its row without a gap id; the own-namespace rule takes the V_ name', () => {
+  assert.equal(checkGapValue(vrow(), rowOfFile(VF(6)), VF(6)).id, 'L-meta-700');
+  assert.equal(checkGapValue(vrow(), rowOfFile(VF(6, 'meta_70')), VF(6, 'meta_70')).id, 'L-meta-70');
+  assert.throws(() => checkGapValue(vrow(), rowOfFile(VF(6, 'meta_7')), VF(6, 'meta_7')), /the step is not on the desk/);
+  const VM = 'PEqualNP.Outside.V_meta_700__k6';
+  checkOwnNamespace(`import Mathlib\nimport PEqualNP.Defs\nnamespace ${VM}\ntheorem up : True := trivial\nend ${VM}\ntheorem ${VM} : True := trivial\n`, VM);
+  assert.throws(() => checkOwnNamespace(`import Mathlib\ntheorem PEqualNP.Outside.V_meta_700__k7 : True := trivial\n`, VM), /line 2: a declaration/, 'the theorem carries the file\'s own k');
+  assert.throws(() => checkOwnNamespace('theorem X : True := trivial\n', 'PEqualNP.Outside.V_meta_700__k06'), /is not the module of an outside proof file/);
+});
+test('value cli: gap writes the instance to statement.txt and check to gap.kind; a wrong name writes nothing', () => {
+  const d = mkdtempSync(pj(tmpdir(), 'guard-value-'));
+  wf(pj(d, 'gaps.json'), JSON.stringify(vrow()));
+  let r = cli('gap', pj(d, 'gaps.json'), 'L-meta-700', VF(6), d, 'check');
+  assert.equal(r.status, 0, r.stdout + r.stderr);
+  assert.equal(readFileSync(pj(d, 'statement.txt'), 'utf8'), 'Size.AtMost f 6 ∧\n  ¬ Size.AtMost f (6 - 1)');
+  assert.equal(readFileSync(pj(d, 'gap.kind'), 'utf8'), 'check\n');
+  assert.equal(readFileSync(pj(d, 'gap.id'), 'utf8'), 'L-meta-700\n');
+  const e = mkdtempSync(pj(tmpdir(), 'guard-value-'));
+  r = cli('gap', pj(d, 'gaps.json'), 'L-meta-700', VF(13), e, 'check');
+  assert.equal(r.status, 1); assert.match(r.stdout, /^REFUSED: the value 13 is above the bound/);
+  assert.throws(() => readFileSync(pj(e, 'statement.txt')));
+  r = cli('gap-of-file', pj(d, 'gaps.json'), VF(4), e);
+  assert.equal(r.status, 0, r.stdout + r.stderr);
+  assert.equal(readFileSync(pj(e, 'statement.txt'), 'utf8'), 'Size.AtMost f 4 ∧\n  ¬ Size.AtMost f (4 - 1)');
+  wf(pj(d, 'imports.json'), '["PEqualNP.Defs"]');
+  wf(pj(d, 'v.lean'), 'import Mathlib\nimport PEqualNP.Defs\ntheorem PEqualNP.Outside.V_meta_700__k6 : True := trivial\n');
+  r = cli('imports', pj(d, 'v.lean'), pj(d, 'imports.json'), VF(6), 'check');
+  assert.equal(r.status, 0, r.stdout + r.stderr);
+  r = cli('imports', pj(d, 'v.lean'), pj(d, 'imports.json'), VF(6), 'reduce');
+  assert.equal(r.status, 1); assert.match(r.stdout, /is a value file/);
+});
+
+// THE STEP'S ROW BY ID (25 Nov): both workflows fetch the desk's row for the one gap from one account-bound address,
+// never the whole list and never through pequalnp.com's DNS, and the advisory's id is the one its file belongs to.
+import { GAP_RE as GAP_RE_ROW, rowOfFile as rowOfFileRow } from './outside-guard.mjs';
+test('both workflows: the row by id from the one desk address, and the advisory id names the file\'s row', () => {
+  const wfs = ['authoritative.yml', 'advisory.yml'].map((n) => [n, readFileSync(new URL(`../workflows/${n}`, import.meta.url), 'utf8')]);
+  const urls = wfs.map(([n, wf]) => {
+    assert.doesNotMatch(wf, /data\.pequalnp\.com|gaps\.json"? *"\$GAPS_URL|GAPS_URL/, `${n}: still fetches the whole list`);
+    const m = wf.match(/^\s+ROW_URL: (\S+)$/m); assert.ok(m, `${n}: no ROW_URL`);
+    assert.equal(wf.match(/curl [^\n]*\$ROW_URL/g)?.length, 1, `${n}: fetches the row other than once`);
+    return m[1];
+  });
+  assert.equal(urls[0], urls[1], 'the two workflows read different desks');
+  assert.equal(urls[0], 'https://pequalnp-desk.pequalnp.workers.dev/desk/row?gap=');
+  assert.match(wfs[0][1], /curl [^\n]*--max-redirs 0[^\n]*"\$ROW_URL\$GAP"/);
+  const line = wfs[1][1].match(/^\s+(gap="L-\$\(basename "\$FILE" \.lean \| cut -c3- \| tr _ -\)")$/m); assert.ok(line, 'advisory: no gap line');
+  assert.match(wfs[1][1], /curl [^\n]*--max-redirs 0[^\n]*"\$ROW_URL\$gap"/);
+  for (const id of ['L-meta-632', 'L-gct-101', 'L-x-0', 'L-clb-034']) {
+    const file = `lean/PEqualNP/Outside/${id.replace(/-/g, '_')}.lean`;
+    const r = spawnSync('sh', ['-c', `${line[1]}; printf %s "$gap"`], { env: { PATH: process.env.PATH, FILE: file }, encoding: 'utf8' });
+    assert.equal(r.stdout, id); assert.ok(GAP_RE_ROW.test(r.stdout));
+    assert.ok(rowOfFileRow(file)({ id, file }), `${file} is not the row of ${id}`);
+  }
 });
